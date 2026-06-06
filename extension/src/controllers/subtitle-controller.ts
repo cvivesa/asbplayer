@@ -374,10 +374,6 @@ export default class SubtitleController {
     }
 
     private _subtitleAnnotationsUpdated(updatedSubtitles: RichSubtitleModel[]): void {
-        if (this.dictionaryTrackSettings) {
-            renderRichTextOntoSubtitles(updatedSubtitles, 'video', this.dictionaryTrackSettings);
-        }
-
         const htmls = this._buildSubtitlesHtml(updatedSubtitles);
         for (const [index, updatedSubtitle] of updatedSubtitles.entries()) {
             const html = htmls[index];
@@ -547,6 +543,8 @@ export default class SubtitleController {
     }
 
     private _buildSubtitlesHtml(subtitles: IndexedSubtitleModel[]) {
+        if (this.dictionaryTrackSettings) renderRichTextOntoSubtitles(subtitles, 'video', this.dictionaryTrackSettings);
+
         return subtitles.map((subtitle) => {
             return {
                 html: () => {

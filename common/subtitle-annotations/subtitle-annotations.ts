@@ -28,20 +28,18 @@ import {
     getFullyKnownTokenStatus,
     isExternalWordSource,
     SettingsProvider,
-    TokenFrequencyAnnotation,
     TokenMatchStrategy,
     TokenMatchStrategyPriority,
-    TokenReadingAnnotation,
     TokenState,
     TokenStatus,
     TokenStyling,
     isWordSource,
-    TokenPitchAccentAnnotation,
-    TokenAnnotationConfigs,
     getEnabledAnnotations,
     getEnabledAnnotationsForHover,
     EnabledAnnotations,
     defaultSettings,
+    shouldUseAnnotation,
+    TokenAnnotationConfigTarget,
 } from '@project/common/settings';
 import { TokenStatusInfo, DictionaryProvider, LemmaResults, TokenResults } from '@project/common/dictionary-db';
 import {
@@ -492,9 +490,8 @@ function untokenize(s: InternalSubtitleModel) {
         s.tokenization.tokens = s.tokenization.tokens.filter((t) => !(t as InternalToken).__internal);
         if (s.tokenization.tokens.length) {
             s.tokenization.error = undefined;
-            for (const token of s.tokenization.tokens) {
-                token.states = [];
-                token.status = undefined;
+            for (const [index, { pos, readings }] of s.tokenization.tokens.entries()) {
+                s.tokenization.tokens[index] = { pos, readings, states: [] };
             }
         } else {
             s.tokenization = undefined;
@@ -881,7 +878,7 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
 
             const allFieldsSet = new Set<string>();
             for (const ts of this.trackStates) {
-                if (!dictionaryStatusCollectionEnabled(ts.dt)) continue;
+                if (!dictionaryStatusCollectionEnabled(ts.dt, { includeStates: false })) continue;
                 for (const field of ts.dt.dictionaryAnkiWordFields.concat(ts.dt.dictionaryAnkiSentenceFields)) {
                     allFieldsSet.add(field);
                 }
@@ -889,7 +886,7 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
             const fields = Array.from(allFieldsSet);
             const allDecksSet = new Set<string>();
             for (const ts of this.trackStates) {
-                if (!dictionaryStatusCollectionEnabled(ts.dt)) continue;
+                if (!dictionaryStatusCollectionEnabled(ts.dt, { includeStates: false })) continue;
                 if (!ts.dt.dictionaryAnkiDecks.length) {
                     allDecksSet.clear(); // Query all decks
                     break;
@@ -977,7 +974,9 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
             this.waniKaniState.refreshing = true;
             if (
                 !this.trackStates.some(
-                    (ts) => dictionaryStatusCollectionEnabled(ts.dt) && ts.dt.dictionaryWaniKaniApiToken.trim()
+                    (ts) =>
+                        dictionaryStatusCollectionEnabled(ts.dt, { includeStates: false }) &&
+                        ts.dt.dictionaryWaniKaniApiToken.trim()
                 )
             ) {
                 return;
@@ -1001,7 +1000,7 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
 
         const waniKaniSnapshots: Record<number, DictionaryStatisticsWaniKaniSnapshot> = {};
         for (const ts of this.trackStates) {
-            if (!dictionaryStatusCollectionEnabled(ts.dt)) continue;
+            if (!dictionaryStatusCollectionEnabled(ts.dt, { includeStates: false })) continue;
 
             try {
                 const records = await this.dictionaryProvider.getRecords(profile, ts.track);
@@ -1313,7 +1312,6 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
                                             sentence.tokenization!.tokens.every(
                                                 (t) =>
                                                     t.frequency !== undefined ||
-                                                    t.states.includes(TokenState.IGNORED) ||
                                                     !HAS_LETTER_REGEX.test(
                                                         reconstructedText.substring(t.pos[0], t.pos[1])
                                                     )
@@ -1436,7 +1434,8 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
                 if (!ts.yt) continue;
                 const tokenizeBulkRes = await ts.yt.tokenizeBulk(texts);
                 if (
-                    ts.dt.dictionaryTokenPitchAccentAnnotation !== TokenPitchAccentAnnotation.NEVER &&
+                    (ts.dt.dictionaryTokenAnnotationConfig.onStatuses.some((l) => l.pitchAccent) ||
+                        ts.dt.dictionaryTokenAnnotationConfig.onStates.some((l) => l.pitchAccent)) &&
                     !ts.yt.getSupportsBulkPitchAccent() &&
                     ts.yt.getSupportsTermEntriesBulk() &&
                     this.initialized &&
@@ -1450,7 +1449,7 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
                     );
                     await ts.yt.termEntriesBulk(tokenTexts, true);
                 }
-                if (!dictionaryStatusCollectionEnabled(ts.dt)) continue; // Still want to bulk tokenize if TokenReadingAnnotation.ALWAYS but no coloring
+                if (!dictionaryStatusCollectionEnabled(ts.dt, { includeStates: true })) continue; // Still want to bulk tokenize if all statuses are enabled but no coloring
                 if (this.shouldCancelBuild) return;
 
                 for (const token of this.tokensForRefresh) {
@@ -1549,9 +1548,7 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
             existingTokenization.error = true;
             return { reconstructedText: fullText, tokenization: existingTokenization };
         }
-        if (!existingTokenization.tokens?.length) {
-            return this._tokenizationModel(fullText, index, ts);
-        }
+        if (!existingTokenization.tokens.length) return this._tokenizationModel(fullText, index, ts);
 
         // We only respect tokens that were not generated by this class i.e. not marked __internal: true
         const externalTokens = existingTokenization.tokens.filter((t) => !(t as InternalToken).__internal);
@@ -1718,16 +1715,10 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
                 }
 
                 // Build token status
-                if (token.states.includes(TokenState.IGNORED) || !HAS_LETTER_REGEX.test(trimmedToken)) {
-                    token.status = getFullyKnownTokenStatus();
-                    const { groupingKey, lemmasGroupingKey } = ts.groupingKeysForToken(trimmedToken, lemmas, undefined);
-                    token.groupingKey = groupingKey;
-                    token.lemmasGroupingKey = lemmasGroupingKey;
-                    continue;
-                }
-                const tokenStatusResult = (await this._tokenStatus(trimmedToken, normalizedToken, ts)) ?? {
-                    status: null,
-                };
+                const tokenStatusResult =
+                    token.states.includes(TokenState.IGNORED) || !HAS_LETTER_REGEX.test(trimmedToken)
+                        ? { status: getFullyKnownTokenStatus() }
+                        : ((await this._tokenStatus(trimmedToken, normalizedToken, ts)) ?? { status: null });
                 const source = 'source' in tokenStatusResult ? tokenStatusResult.source : undefined;
                 token.status = tokenStatusResult.status;
                 const { groupingKey, lemmasGroupingKey } = ts.groupingKeysForToken(trimmedToken, lemmas, source);
@@ -1753,11 +1744,6 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
 
     private async _updateFrequency(token: Token, trimmedToken: string, index: number, ts: TrackState): Promise<void> {
         if (!ts.yt) throw new Error('Yomitan uninitialized - cannot update token frequency');
-        const ano = this.generateStatistics
-            ? TokenFrequencyAnnotation.ALWAYS
-            : ts.dt.dictionaryTokenFrequencyAnnotation;
-        if (ano === TokenFrequencyAnnotation.NEVER) return;
-        if (ano === TokenFrequencyAnnotation.UNCOLLECTED_ONLY && token.status !== TokenStatus.UNCOLLECTED) return;
         if (this.initialized || ts.yt.getSupportsBulkFrequency()) {
             token.frequency = await ts.yt.frequency(trimmedToken);
         } else {
@@ -1767,20 +1753,7 @@ export class SubtitleAnnotations extends SubtitleCollection<RichSubtitleModel> {
 
     private async _updatePitchAccent(token: Token, trimmedToken: string, index: number, ts: TrackState): Promise<void> {
         if (!ts.yt) throw new Error('Yomitan uninitialized - cannot update token pitch accent');
-        switch (ts.dt.dictionaryTokenPitchAccentAnnotation) {
-            case TokenPitchAccentAnnotation.ALWAYS:
-                break;
-            case TokenPitchAccentAnnotation.LEARNING_OR_BELOW:
-                if (token.status == null || token.status > TokenStatus.LEARNING) return;
-                break;
-            case TokenPitchAccentAnnotation.UNKNOWN_OR_BELOW:
-                if (token.status == null || token.status > TokenStatus.UNKNOWN) return;
-                break;
-            case TokenPitchAccentAnnotation.NEVER:
-                return;
-            default:
-                throw new Error(`Unknown TokenPitchAccentAnnotation: ${ts.dt.dictionaryTokenPitchAccentAnnotation}`);
-        }
+        if (token.status == null || !shouldUseAnnotation('pitchAccent', token.status, token.states, ts.dt)) return;
         if ((this.initialized && !this.generateStatisticsRequested) || ts.yt.getSupportsBulkPitchAccent()) {
             token.pitchAccent = await ts.yt.pitchAccent(trimmedToken);
         } else {
@@ -1978,7 +1951,7 @@ export const getAnnotationsHtml = (text: string, richText: string | undefined, r
 
 export const renderRichTextOntoSubtitles = (
     subtitles: RichSubtitleModel[],
-    hoverTarget: keyof TokenAnnotationConfigs,
+    hoverTarget: TokenAnnotationConfigTarget,
     dictionaryTracks: DictionaryTrack[] | undefined
 ) => {
     if (dictionaryTracks?.length !== defaultSettings.dictionaryTracks.length) {
@@ -2010,14 +1983,18 @@ export const renderRichTextOntoSubtitles = (
             continue;
         }
         const ta = trackAnnotations[subtitle.track];
+        const hasExternalReading = subtitle.tokenization.tokens.some(
+            (token) => !(token as InternalToken).__internal && token.readings.length > 0
+        );
 
-        subtitle.richText = ta.isRichTextEnabled
-            ? computeRichText(subtitle.text, subtitle.tokenization, {
-                  dt: ta.dt,
-                  enabledAnnotations: ta.richTextEnabledAnnotations,
-                  allowAsciiReading,
-              })
-            : undefined;
+        subtitle.richText =
+            ta.isRichTextEnabled || hasExternalReading
+                ? computeRichText(subtitle.text, subtitle.tokenization, {
+                      dt: ta.dt,
+                      enabledAnnotations: ta.richTextEnabledAnnotations,
+                      allowAsciiReading,
+                  })
+                : undefined;
         subtitle.richTextOnHover = ta.isRichTextOnHoverEnabled
             ? computeRichText(subtitle.text, subtitle.tokenization, {
                   dt: ta.dt,
@@ -2035,13 +2012,8 @@ interface TokenStyleState {
 }
 
 const computeRichText = (fullText: string, tokenization: Tokenization, ss: TokenStyleState) => {
-    if (tokenization.error) {
-        return `<span ${ERROR_STYLE}>${fullText}</span>`;
-    }
-
-    if (!tokenization.tokens?.length) {
-        return undefined;
-    }
+    if (tokenization.error) return `<span ${ERROR_STYLE}>${fullText}</span>`;
+    if (!tokenization.tokens.length) return;
 
     const parts: string[] = [];
     const prevPitch: PitchAccentContext = {}; // Context from the previous token to correctly determine pitch for attached particle
@@ -2082,7 +2054,8 @@ export const applyTokenStyle = (fullText: string, token: Token, prevPitch: Pitch
     if (
         token.pitchAccent != null &&
         ss.enabledAnnotations.pitchAccent &&
-        (!token.readings.length || ss.enabledAnnotations.reading)
+        (!token.readings.length ||
+            (ss.enabledAnnotations.reading && shouldUseAnnotation('reading', token.status!, token.states, ss.dt)))
     ) {
         return `${s}>${tokenText}</span>`; // Colorize the pitch accent annotation only when being shown
     }
@@ -2130,24 +2103,9 @@ const applyReadingAnnotation = (
             clearPitchAccentContext(prevPitch);
             return tokenText;
         }
-        const ignoredToken = token.states.includes(TokenState.IGNORED);
-        const ano = ignoredToken
-            ? ss.dt.dictionaryDisplayIgnoredTokenReadings
-                ? TokenReadingAnnotation.ALWAYS
-                : TokenReadingAnnotation.NEVER
-            : ss.dt.dictionaryTokenReadingAnnotation;
-        if (ano === TokenReadingAnnotation.NEVER) {
+        if (token.status == null || !shouldUseAnnotation('reading', token.status, token.states, ss.dt)) {
             clearPitchAccentContext(prevPitch);
             return tokenText;
-        }
-        if (token.status !== undefined && token.status !== null) {
-            if (
-                (ano === TokenReadingAnnotation.LEARNING_OR_BELOW && token.status > TokenStatus.LEARNING) ||
-                (ano === TokenReadingAnnotation.UNKNOWN_OR_BELOW && token.status > TokenStatus.UNKNOWN)
-            ) {
-                clearPitchAccentContext(prevPitch);
-                return tokenText;
-            }
         }
     }
 
@@ -2263,11 +2221,7 @@ const pitchAccentHtml = (
 const applyFrequencyAnnotation = (tokenText: string, token: Token, ss: TokenStyleState) => {
     if (!ss.enabledAnnotations.frequency) return tokenText;
     if (token.frequency == null || !HAS_LETTER_REGEX.test(tokenText)) return tokenText;
-    if (ss.dt.dictionaryTokenFrequencyAnnotation === TokenFrequencyAnnotation.NEVER) return tokenText;
-    if (
-        ss.dt.dictionaryTokenFrequencyAnnotation === TokenFrequencyAnnotation.UNCOLLECTED_ONLY &&
-        token.status !== TokenStatus.UNCOLLECTED
-    ) {
+    if (token.status == null || !shouldUseAnnotation('frequency', token.status, token.states, ss.dt)) {
         return tokenText;
     }
     return `<ruby class="${ASB_FREQUENCY_CLASS}">${tokenText}<rt>${token.frequency}</rt></ruby>`;
